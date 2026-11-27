@@ -1,30 +1,38 @@
+# syntax=docker/dockerfile:1
 ###############################################################################
 # Stage 1: Builder
 ###############################################################################
-# daocloud 镜像源（m.daocloud.io）2026-09 起匿名拉取返回 401，改回官方 Docker Hub 源
 FROM node:24-slim AS builder
 
 WORKDIR /usr/src/microsoft-rewards-script
 
-ENV PLAYWRIGHT_BROWSERS_PATH=0
-
 # Copy package files
 COPY package.json package-lock.json tsconfig.json ./
 
-# Install all dependencies required to build the script
-RUN npm ci --ignore-scripts
+# Install all dependencies required to build the script (npm cache is a BuildKit
+# cache mount, it never ends up in the layer)
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --ignore-scripts
 
 # Copy source and build
 COPY . .
 RUN npm run build
 
-# Remove build dependencies, and reinstall only runtime dependencies
-RUN rm -rf node_modules \
-    && npm ci --omit=dev --ignore-scripts \
-    && npm cache clean --force
+###############################################################################
+# Stage 2: Production dependencies
+###############################################################################
+# Separate stage so the runtime image only ever installs production deps once
+FROM node:24-slim AS prod-deps
+
+WORKDIR /usr/src/microsoft-rewards-script
+
+COPY package.json package-lock.json ./
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --ignore-scripts
 
 ###############################################################################
-# Stage 2: Runtime
+# Stage 3: Runtime
 ###############################################################################
 FROM node:24-slim AS runtime
 
@@ -37,8 +45,10 @@ ENV NODE_ENV=production \
     FORCE_HEADLESS=1 \
     NODE_OPTIONS=--disable-warning=ExperimentalWarning
 
-# Install minimal system libraries required for Chromium headless to run,
-# plus jq (for config generation/patching) and gettext-base (for envsubst)
+# Install only the system libraries required by the Chromium headless shell,
+# plus jq (config generation/patching) and gettext-base (envsubst).
+# Keep this list explicit instead of using `patchright install --with-deps`,
+# which would reinstall an overlapping dependency set (~200MB) on every build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cron \
     gettext-base \
@@ -72,24 +82,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxss1 \
     libxtst6 \
     libdouble-conversion3 \
+    libcups2 \
+    libxkbcommon0 \
+    libxshmfence1 \
     fonts-liberation \
-    fonts-noto-core \
     fonts-noto-color-emoji \
-    fonts-freefont-ttf \
-    fonts-droid-fallback \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
-# Copy compiled application and dependencies from builder stage
+# Copy compiled application and dependencies from build stages
 COPY --from=builder /usr/src/microsoft-rewards-script/dist ./dist
 COPY --from=builder /usr/src/microsoft-rewards-script/package*.json ./
-COPY --from=builder /usr/src/microsoft-rewards-script/node_modules ./node_modules
+COPY --from=prod-deps /usr/src/microsoft-rewards-script/node_modules ./node_modules
 
 # Install patchright's stealth-patched Chromium headless shell.
-# The container is headless-only so the full browser isn't needed; then clean up
-# chromium 二进制走 npmmirror 国内镜像（cdn.playwright.dev 国内直连极慢，2026-11 实测 114MB 约 10 分钟）
+# The container is headless-only so the full browser isn't needed.
+# 二进制走 npmmirror 国内镜像（cdn.playwright.dev 国内直连极慢，2026-11 实测 114MB 约 10 分钟）
 ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 RUN set -eux; \
-    npx patchright install --with-deps --only-shell chromium; \
+    npx patchright install --only-shell chromium; \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 # Copy config example into the image so entrypoint can use it as a fallback

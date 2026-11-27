@@ -6,6 +6,16 @@ on:
         paths:
             - package.json
     workflow_dispatch:
+        inputs:
+            force:
+                description: 'Force rebuild even if the image tag already exists'
+                type: choice
+                options: ['false', 'true']
+                default: 'false'
+            platforms:
+                description: 'Target platforms (comma separated)'
+                type: string
+                default: 'linux/amd64'
 
 permissions:
     contents: write
@@ -101,13 +111,13 @@ jobs:
                   fi
 
             - name: Stop if Docker image already exists
-              if: steps.imgcheck.outputs.exists == 'true'
+              if: steps.imgcheck.outputs.exists == 'true' && inputs.force != 'true'
               run: |
                   echo "LOG: Docker image already exists for version ${{ steps.version.outputs.current }}. Nothing to do."
                   exit 0
 
             - name: Compute image tags
-              if: steps.imgcheck.outputs.exists != 'true'
+              if: steps.imgcheck.outputs.exists != 'true' || inputs.force == 'true'
               id: tags
               run: |
                   set -euo pipefail
@@ -128,20 +138,20 @@ jobs:
                   echo "$TAGS"
 
             - name: Set up QEMU
-              if: steps.imgcheck.outputs.exists != 'true'
+              if: (steps.imgcheck.outputs.exists != 'true' || inputs.force == 'true') && contains(inputs.platforms || 'linux/amd64', 'arm64')
               uses: docker/setup-qemu-action@v3
 
             - name: Set up Docker Buildx
-              if: steps.imgcheck.outputs.exists != 'true'
+              if: steps.imgcheck.outputs.exists != 'true' || inputs.force == 'true'
               uses: docker/setup-buildx-action@v3
 
             - name: Build and push Docker image
-              if: steps.imgcheck.outputs.exists != 'true'
+              if: steps.imgcheck.outputs.exists != 'true' || inputs.force == 'true'
               uses: docker/build-push-action@v5
               with:
                   context: .
                   push: true
-                  platforms: linux/amd64,linux/arm64
+                  platforms: ${{ inputs.platforms || 'linux/amd64' }}
                   tags: ${{ steps.tags.outputs.list }}
                   cache-from: type=gha,scope=${{ github.ref_name }}
                   cache-to: type=gha,scope=${{ github.ref_name }},mode=max
